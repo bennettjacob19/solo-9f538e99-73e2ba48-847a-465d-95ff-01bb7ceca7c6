@@ -155,9 +155,14 @@ async def terminate_process_group(
 
 
 async def spawn(
-    command: str, workdir: Path, env: dict[str, str], stdout, stderr
+    command: str, workdir: Path, env: dict[str, str]
 ) -> tuple["object", int, int, int]:
-    """以独立会话/进程组启动命令，返回 (proc, pid, pgid, starttime)。"""
+    """以独立会话/进程组启动命令，返回 (proc, pid, pgid, starttime)。
+
+    stdout/stderr 统一走 PIPE 且 stderr 并入 stdout，由调度器侧的输出泵
+    读取并经 :class:`~app.logcap.BoundedLogWriter` 受上限落盘；不直接把
+    文件描述符交给子进程，否则无法在写入侧执行字节上限管控。
+    """
     import asyncio
 
     proc = await asyncio.create_subprocess_exec(
@@ -166,8 +171,8 @@ async def spawn(
         command,
         cwd=workdir,
         env=env,
-        stdout=stdout,
-        stderr=stderr,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
     pid = proc.pid

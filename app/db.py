@@ -33,12 +33,20 @@ CREATE TABLE IF NOT EXISTS steps (
     pid             INTEGER,
     pgid            INTEGER,
     proc_starttime  REAL,
+    log_overflow    INTEGER NOT NULL DEFAULT 0,
     started_at      TEXT,
     finished_at     TEXT,
     UNIQUE(build_id, step_uid),
     FOREIGN KEY(build_id) REFERENCES builds(id)
 );
 """
+
+# 旧版本数据库的增量迁移：新增列用 IF NOT EXISTS 等价的 PRAGMA 检查完成
+_COLUMN_MIGRATIONS = {
+    "steps": {
+        "log_overflow": "ALTER TABLE steps ADD COLUMN log_overflow INTEGER NOT NULL DEFAULT 0",
+    },
+}
 
 
 class Database:
@@ -56,6 +64,17 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.executescript(_SCHEMA)
+        await self._migrate()
+
+    async def _migrate(self) -> None:
+        """对既有数据库做向后兼容的增量加列（重启恢复依赖这些列）。"""
+        assert self._conn is not None
+        for table, columns in _COLUMN_MIGRATIONS.items():
+            cur = await self._conn.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in await cur.fetchall()}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    await self._conn.execute(ddl)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -174,6 +193,7 @@ class Database:
         now: str,
         exit_code: Optional[int] = None,
         detail: Optional[str] = None,
+        log_overflow: bool = False,
     ) -> None:
         from .models import STEP_TERMINAL
 
@@ -189,8 +209,18 @@ class Database:
         if detail is not None:
             sets.append("detail=?")
             params.append(detail)
+        if log_overflow:
+            # 只置位不清零：一旦超限即永久事实，后续任何状态更新都不能抹掉
+            sets.append("log_overflow=1")
         params.append(step_pk)
         await self.execute(f"UPDATE steps SET {', '.join(sets)} WHERE id=?", tuple(params))
+
+    async def mark_log_overflow(self, step_pk: int) -> None:
+        """首次确认日志超限时立即落库，保证重启也能识别该失败原因。"""
+        await self.execute(
+            "UPDATE steps SET log_overflow=1 WHERE id=? AND log_overflow=0",
+            (step_pk,),
+        )
 
     async def list_nonterminal_builds(self) -> list[aiosqlite.Row]:
         return await self.all(

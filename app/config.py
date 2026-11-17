@@ -31,8 +31,9 @@ KILL_GRACE_SECONDS = _env_float("PIPELINE_KILL_GRACE_SECONDS", "60")
 PROC_POLL_INTERVAL = _env_float("PIPELINE_PROC_POLL_INTERVAL", "0.1")
 SCHEDULER_TICK = _env_float("PIPELINE_SCHEDULER_TICK", "0.2")
 
-# 日志接口单次最多返回字节数
-LOG_MAX_BYTES = int(os.environ.get("PIPELINE_LOG_MAX_BYTES", str(1024 * 1024)))
+# 每个步骤日志文件（stdout+stderr 合并）的统一落盘上限：
+# 写入侧硬约束，任何时刻文件都不会超过该字节数；日志查询同样以此为返回上限
+LOG_MAX_BYTES = max(1, int(os.environ.get("PIPELINE_LOG_MAX_BYTES", str(1024 * 1024))))
 
 
 def ensure_dirs() -> None:

@@ -73,6 +73,11 @@ class LogOut(BaseModel):
     step_id: str
     status: str
     truncated: bool
+    # 日志在步骤侧已触达 PIPELINE_LOG_MAX_BYTES：文件只保留上限内的已保存内容
+    log_limit_exceeded: bool = False
+    # 超限原因（未超限时为 None）；未超限步骤的查询行为与旧版完全一致
+    reason: Optional[str] = None
+    log_max_bytes: int
     content: str
 
 

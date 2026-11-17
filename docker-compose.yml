@@ -9,6 +9,8 @@ services:
       # 全局最多两步并行（默认值，显式声明便于审计）
       PIPELINE_MAX_PARALLEL: "2"
       PIPELINE_MAX_STEPS: "12"
+      # 每个步骤 stdout/stderr 合并日志的统一落盘上限（默认 1 MiB）
+      PIPELINE_LOG_MAX_BYTES: "1048576"
       PIPELINE_DATA_DIR: "/data"
     volumes:
       # 挂载工作目录：所有命令在此目录下按构建隔离执行，重启后数据保留

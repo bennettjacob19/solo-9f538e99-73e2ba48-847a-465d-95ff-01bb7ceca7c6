@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from . import __version__, config
 from .db import Database
+from .logcap import OVERFLOW_MARKER, OVERFLOW_REASON
 from .models import BuildCreate, BuildOut, CancelOut, LogOut, StepOut
 from .scheduler import Scheduler
 
@@ -79,6 +80,7 @@ async def health() -> dict:
         "version": __version__,
         "max_steps": config.MAX_STEPS,
         "max_parallel": config.MAX_PARALLEL,
+        "log_max_bytes": config.LOG_MAX_BYTES,
         "recovery": getattr(app.state, "recovery", None),
     }
 
@@ -128,13 +130,26 @@ async def get_step_log(
     if step is None:
         raise HTTPException(status_code=404, detail="构建或步骤不存在")
     path = Path(step["log_path"])
+    # 超限事实以 SQLite 为准（重启后仍在），文件内标记作为兜底识别
+    limit_exceeded = bool(step["log_overflow"])
     if not path.exists():
-        return LogOut(build_id=build_id, step_id=step_id, status=step["status"],
-                      truncated=False, content="")
-    # 在线程池读文件，避免大日志阻塞事件循环
+        return LogOut(
+            build_id=build_id,
+            step_id=step_id,
+            status=step["status"],
+            truncated=False,
+            log_limit_exceeded=limit_exceeded,
+            reason=OVERFLOW_REASON if limit_exceeded else None,
+            log_max_bytes=config.LOG_MAX_BYTES,
+            content="",
+        )
+    # 在线程池读文件，避免大日志阻塞事件循环；文件本身已受写入侧上限约束
     raw = await asyncio.to_thread(path.read_bytes)
+    if not limit_exceeded:
+        limit_exceeded = OVERFLOW_MARKER.encode("utf-8") in raw
     truncated = False
     if len(raw) > config.LOG_MAX_BYTES:
+        # 理论上写入侧已保证不超限，这里仅作防御性截断
         raw = raw[-config.LOG_MAX_BYTES:]
         truncated = True
     content = raw.decode("utf-8", errors="replace")
@@ -146,5 +161,8 @@ async def get_step_log(
         step_id=step_id,
         status=step["status"],
         truncated=truncated,
+        log_limit_exceeded=limit_exceeded,
+        reason=OVERFLOW_REASON if limit_exceeded else None,
+        log_max_bytes=config.LOG_MAX_BYTES,
         content=content,
     )

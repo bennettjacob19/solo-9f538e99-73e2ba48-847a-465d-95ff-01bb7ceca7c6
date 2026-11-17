@@ -1,0 +1,23 @@
+{
+  "name": "example-log-overflow",
+  "steps": [
+    {
+      "id": "independent-branch",
+      "command": "echo '独立分支：不受异常编译影响，继续执行'",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "noisy-compile",
+      "command": "for i in $(seq 1 1000000); do echo \"编译输出 padding-padding-padding-$i\"; done",
+      "depends_on": [],
+      "timeout_seconds": 60
+    },
+    {
+      "id": "package-after-compile",
+      "command": "echo '这一步不应被执行（上游日志超限已判失败，后代跳过）'",
+      "depends_on": ["noisy-compile"],
+      "timeout_seconds": 10
+    }
+  ]
+}

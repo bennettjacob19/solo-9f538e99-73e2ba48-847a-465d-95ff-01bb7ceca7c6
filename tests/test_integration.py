@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import signal
 import socket
@@ -16,6 +15,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from app.proc import list_pgid_members
 
 ROOT = Path(__file__).resolve().parent.parent
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
@@ -30,9 +31,10 @@ def _free_port() -> int:
 class ServerHarness:
     __test__ = False  # 非测试类，避免 pytest 误收集
 
-    def __init__(self, data_dir: Path, port: int):
+    def __init__(self, data_dir: Path, port: int, extra_env: dict | None = None):
         self.data_dir = data_dir
         self.port = port
+        self.extra_env = extra_env or {}
         self.proc: subprocess.Popen | None = None
         self.log_file: Path | None = None
         self.client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30)
@@ -45,6 +47,7 @@ class ServerHarness:
             "PIPELINE_KILL_GRACE_SECONDS": "10",
             "PIPELINE_PROC_POLL_INTERVAL": "0.05",
             "PIPELINE_SCHEDULER_TICK": "0.05",
+            **self.extra_env,
         }
         # 输出落文件而不是 PIPE：管道缓冲写满会冻结 uvicorn 事件循环
         self.log_file = self.data_dir / "server.log"
@@ -397,5 +400,164 @@ def test_404_and_bad_payloads(server):
 def test_health_and_docs(server):
     health = server.client.get("/health").json()
     assert health["status"] == "ok" and health["max_parallel"] == 2
+    assert health["log_max_bytes"] == 1024 * 1024  # 默认 1 MiB
     assert server.client.get("/docs").status_code == 200
     assert server.client.get("/openapi.json").status_code == 200
+
+
+# ------------------------------------------------- 10. 日志落盘上限（新功能）
+
+LOG_CAP = 4096
+
+
+@pytest.fixture(scope="module")
+def capped_server(tmp_path_factory):
+    srv = ServerHarness(
+        tmp_path_factory.mktemp("capped-data"),
+        _free_port(),
+        extra_env={"PIPELINE_LOG_MAX_BYTES": str(LOG_CAP)},
+    )
+    srv.start()
+    yield srv
+    srv.stop()
+
+
+def _step_row(data_dir: Path, build_id: int, step_uid: str) -> dict:
+    import sqlite3
+
+    conn = sqlite3.connect(data_dir / "pipeline.db")
+    try:
+        row = conn.execute(
+            "SELECT pid, pgid, log_overflow, status FROM steps "
+            "WHERE build_id=? AND step_uid=?",
+            (build_id, step_uid),
+        ).fetchone()
+        return {"pid": row[0], "pgid": row[1], "log_overflow": row[2], "status": row[3]}
+    finally:
+        conn.close()
+
+
+def _log_file(data_dir: Path, build_id: int, step_uid: str) -> Path:
+    return data_dir / "logs" / str(build_id) / f"{step_uid}.log"
+
+
+def test_log_overflow_kills_group_fails_and_skips_dependents(capped_server):
+    bid = submit(capped_server.client, "log-overflow", [
+        step(
+            "flood",
+            # 持续大量输出，必定在运行中触达 4 KiB 上限
+            "for i in $(seq 1 100000); do echo \"padding-line-$i-padding\"; done",
+            timeout=30,
+        ),
+        step("independent", "echo independent-ok"),
+        step("child", "echo should-not-run", ["flood"]),
+    ])
+    detail = wait_build(capped_server.client, bid, timeout=40)
+    assert detail["status"] == "failed"
+    sm = step_map(detail)
+    assert sm["flood"]["status"] == "failed"
+    assert "上限" in (sm["flood"]["detail"] or "")
+    # 后代跳过，独立分支不受影响
+    assert sm["child"]["status"] == "skipped"
+    assert sm["independent"]["status"] == "succeeded"
+
+    row = _step_row(capped_server.data_dir, bid, "flood")
+    assert row["log_overflow"] == 1
+    # 进程组已终止：组内无任何残留成员（名额在清空前不会释放）
+    assert list_pgid_members(row["pgid"]) == []
+
+    log_file = _log_file(capped_server.data_dir, bid, "flood")
+    assert log_file.stat().st_size <= LOG_CAP  # 磁盘文件绝不超限
+
+    payload = capped_server.client.get(f"/builds/{bid}/steps/flood/logs").json()
+    assert payload["log_limit_exceeded"] is True
+    assert payload["reason"] and "上限" in payload["reason"]
+    assert payload["log_max_bytes"] == LOG_CAP
+    assert len(payload["content"].encode("utf-8")) <= LOG_CAP
+    assert len(payload["content"]) > 0  # 已保存内容仍可查询
+    assert "padding-line" in payload["content"]
+    # tail 参数在超限日志上仍然有效
+    tailed = capped_server.client.get(
+        f"/builds/{bid}/steps/flood/logs?tail=1"
+    ).json()
+    assert len(tailed["content"].splitlines()) == 1
+
+
+def test_overflow_after_clean_exit_still_fails_and_gates_dependents(capped_server):
+    # 命令自身退出码为 0，但退出前已把日志写超：必须先抽干管道确认超限，
+    # 不能因为 exit=0 就放行依赖
+    bid = submit(capped_server.client, "exit-zero-overflow", [
+        step(
+            "producer",
+            "head -c 20000 /dev/zero | tr '\\0' 'x'; echo done; exit 0",
+            timeout=15,
+        ),
+        step("down", "echo should-not-run", ["producer"]),
+    ])
+    detail = wait_build(capped_server.client, bid, timeout=30)
+    sm = step_map(detail)
+    assert sm["producer"]["status"] == "failed"
+    assert sm["producer"]["exit_code"] == 0  # 退出码确实是 0
+    assert "上限" in (sm["producer"]["detail"] or "")
+    assert sm["down"]["status"] == "skipped"  # 未确认日志未超限，依赖不放行
+
+    log_file = _log_file(capped_server.data_dir, bid, "producer")
+    assert log_file.stat().st_size <= LOG_CAP
+    payload = capped_server.client.get(f"/builds/{bid}/steps/producer/logs").json()
+    assert payload["log_limit_exceeded"] is True and payload["reason"]
+
+
+def test_non_overflow_step_keeps_original_log_behavior(capped_server):
+    bid = submit(capped_server.client, "small-log", [
+        step("a", "echo hello-world"),
+    ])
+    detail = wait_build(capped_server.client, bid)
+    assert detail["status"] == "succeeded"
+    payload = capped_server.client.get(f"/builds/{bid}/steps/a/logs").json()
+    assert payload["log_limit_exceeded"] is False
+    assert payload["reason"] is None
+    assert payload["truncated"] is False
+    assert payload["log_max_bytes"] == LOG_CAP
+    assert "hello-world" in payload["content"]
+    assert _log_file(capped_server.data_dir, bid, "a").stat().st_size <= LOG_CAP
+
+
+def test_overflow_failure_is_recognized_after_restart(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("restart-overflow")
+    port = _free_port()
+    env = {"PIPELINE_LOG_MAX_BYTES": str(LOG_CAP)}
+    srv = ServerHarness(data_dir, port, extra_env=env)
+    srv.start()
+    try:
+        bid = submit(srv.client, "overflow-then-restart", [
+            step(
+                "flood",
+                "for i in $(seq 1 100000); do echo \"padding-$i-padding\"; done",
+                timeout=30,
+            ),
+        ])
+        detail = wait_build(srv.client, bid, timeout=40)
+        assert step_map(detail)["flood"]["status"] == "failed"
+        assert _step_row(data_dir, bid, "flood")["log_overflow"] == 1
+    finally:
+        srv.stop()
+
+    # 同数据目录重启：终态失败与超限原因必须仍可识别
+    srv2 = ServerHarness(data_dir, port, extra_env=env)
+    srv2.start()
+    try:
+        detail = srv2.client.get(f"/builds/{bid}").json()
+        assert detail["status"] == "failed"  # 终态不被恢复逻辑改写
+        sm = step_map(detail)
+        assert sm["flood"]["status"] == "failed"
+        assert "上限" in (sm["flood"]["detail"] or "")
+        assert _step_row(data_dir, bid, "flood")["log_overflow"] == 1
+
+        payload = srv2.client.get(f"/builds/{bid}/steps/flood/logs").json()
+        assert payload["log_limit_exceeded"] is True
+        assert payload["reason"] and "上限" in payload["reason"]
+        assert len(payload["content"].encode("utf-8")) <= LOG_CAP
+        assert "padding" in payload["content"]
+        assert _log_file(data_dir, bid, "flood").stat().st_size <= LOG_CAP
+    finally:
+        srv2.stop()

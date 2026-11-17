@@ -18,6 +18,11 @@ from typing import Any, Optional
 
 from . import config, proc
 from .db import Database
+from .logcap import (
+    OVERFLOW_REASON,
+    BoundedLogWriter,
+    bounded_append_log,
+)
 from .models import BUILD_TERMINAL, BuildCreate, validate_dag
 
 _STEP_FAIL_STATES = {"failed", "skipped", "cancelled", "interrupted"}
@@ -117,9 +122,9 @@ class Scheduler:
                     None, pgid, "重启清理", log_lines
                 )
                 killed_groups += 1
-                self._append_log(step["log_path"], log_lines)
+                bounded_append_log(step["log_path"], log_lines)
                 if not cleared:
-                    self._append_log(
+                    bounded_append_log(
                         step["log_path"], ["[runner] 警告: 重启清理超过硬等上限仍有残留"]
                     )
 
@@ -130,8 +135,10 @@ class Scheduler:
                         "interrupted",
                         _now(),
                         detail="API 进程重启，步骤被标记中断，不再启动",
+                        # 重启前已确认的日志超限事实必须保留并体现在终态上
+                        log_overflow=bool(step["log_overflow"]),
                     )
-                    self._append_log(
+                    bounded_append_log(
                         step["log_path"], ["[runner] API 重启：该步骤标记为 interrupted"]
                     )
             await self.db.set_build_status(
@@ -168,7 +175,7 @@ class Scheduler:
                             statuses[uid] = task.result()
                         except Exception as exc:  # 任务异常按失败处理
                             statuses[uid] = "failed"
-                            self._append_log(
+                            bounded_append_log(
                                 by_id[uid]["log_path"],
                                 [f"[runner] 步骤任务异常: {exc!r}"],
                             )
@@ -271,61 +278,113 @@ class Scheduler:
         workdir = config.WORKDIR_ROOT / str(build_id)
         workdir.mkdir(parents=True, exist_ok=True)
         log_path = Path(row["log_path"])
-        log_lines = [
-            f"[runner] build={build_id} step={step_uid} 开始",
-            f"[runner] workdir={workdir}",
-            f"[runner] command={command}",
-            f"[runner] timeout={timeout}s",
-        ]
-        self._append_log(log_path, log_lines)
-
-        env = {
-            **os.environ,
-            "PIPELINE_BUILD_ID": str(build_id),
-            "PIPELINE_STEP_ID": step_uid,
-        }
-        log_f = open(log_path, "ab", buffering=0)
+        # 步骤全部输出（stdout+stderr 合并）与 runner 元数据共用一个受上限写入器，
+        # 保证日志文件任何时刻都不超过 PIPELINE_LOG_MAX_BYTES
+        writer = BoundedLogWriter(str(log_path))
         try:
+            for line in (
+                f"[runner] build={build_id} step={step_uid} 开始",
+                f"[runner] workdir={workdir}",
+                f"[runner] command={command}",
+                f"[runner] timeout={timeout}s",
+                f"[runner] log_max_bytes={config.LOG_MAX_BYTES}",
+            ):
+                writer.append_line(line)
+
+            env = {
+                **os.environ,
+                "PIPELINE_BUILD_ID": str(build_id),
+                "PIPELINE_STEP_ID": step_uid,
+            }
             try:
-                process, pid, pgid, starttime = await proc.spawn(
-                    command, workdir, env, log_f, log_f
-                )
+                process, pid, pgid, starttime = await proc.spawn(command, workdir, env)
             except Exception as exc:  # 命令本身都无法启动
                 await self.db.set_step_status(
                     step_pk, "failed", _now(), detail=f"进程启动失败: {exc}"
                 )
-                self._append_log(log_path, [f"[runner] 进程启动失败: {exc}"])
+                writer.append_line(f"[runner] 进程启动失败: {exc}")
                 return "failed"
 
             await self.db.set_step_process(step_pk, pid, pgid, starttime, _now())
             cancel_event = self._build_events[build_id]
-            outcome, detail = await self._watch(process, timeout, cancel_event)
+            overflow_event = asyncio.Event()
 
-            # 进入清理阶段即对外可见：终态尚未确认、名额仍占用
-            await self.db.set_step_status(
-                step_pk, "cleaning_up", _now(), detail=detail
-            )
-            leftovers_before = await asyncio.to_thread(
-                proc.list_pgid_members, pgid
-            )
-            had_leftovers = bool(leftovers_before)
-            cleanup_log: list[str] = []
-            if outcome == "timeout":
-                reason = "步骤超时"
-            elif outcome == "cancelled":
-                reason = "构建取消"
-            else:
-                reason = "主命令退出后检查残留子进程"
-            cleared = await proc.terminate_process_group(
-                process, pgid, reason, cleanup_log
-            )
-            self._append_log(log_path, cleanup_log)
-            exit_code = process.returncode
+            async def _pump_output() -> None:
+                """读取合并后的 stdout/stderr 并受上限落盘。
 
+                首次触达上限即置位 overflow_event（竞速终止进程组），
+                并立即把超限事实落库，确保即使 API 重启也能识别该失败。
+                """
+                reader = process.stdout
+                assert reader is not None
+                while True:
+                    chunk = await reader.read(64 * 1024)
+                    if not chunk:  # EOF：管道随进程组所有写端关闭而结束
+                        return
+                    if writer.write(chunk):
+                        # 标记已由写入器在文件内原位盖好，这里只负责落库与通知
+                        await self.db.mark_log_overflow(step_pk)
+                        overflow_event.set()
+
+            pump_task = asyncio.create_task(
+                _pump_output(), name=f"build-{build_id}-step-{step_uid}-log"
+            )
+            pump_error: Optional[BaseException] = None
+            cleared = False
+            had_leftovers = False
+            exit_code: Optional[int] = None
+            try:
+                outcome, detail = await self._watch(
+                    process, timeout, cancel_event, overflow_event
+                )
+                # 进入清理阶段即对外可见：终态尚未确认、名额仍占用
+                await self.db.set_step_status(
+                    step_pk, "cleaning_up", _now(), detail=detail
+                )
+                leftovers_before = await asyncio.to_thread(
+                    proc.list_pgid_members, pgid
+                )
+                had_leftovers = bool(leftovers_before)
+                cleanup_log: list[str] = []
+                if outcome == "log_overflow":
+                    reason = "日志超过落盘上限"
+                elif outcome == "timeout":
+                    reason = "步骤超时"
+                elif outcome == "cancelled":
+                    reason = "构建取消"
+                else:
+                    reason = "主命令退出后检查残留子进程"
+                # 超限时进程可能仍在运行，统一走进程组终止流程，清空前不释放名额。
+                # 必须先终止整个进程组：后台/遗留子进程持有管道写端，不先杀掉，
+                # 输出泵的 EOF 永远不会到来（清理与抽干会互相等待）。
+                cleared = await proc.terminate_process_group(
+                    process, pgid, reason, cleanup_log
+                )
+                for line in cleanup_log:
+                    writer.append_line(line)
+                exit_code = process.returncode
+
+                # 进程组已清空 -> 管道所有写端关闭，此时抽干管道内残留输出并
+                # 复核日志是否超限。即使命令早已退出，未确认日志未超限时
+                # 不会写入 succeeded，依赖也就不会被放行。
+                pump_error = await _safe_cancel(pump_task)
+            finally:
+                # 异常路径（如清理阶段报错）也要兜底收掉输出泵，避免任务泄漏
+                if not pump_task.done():
+                    pump_task.cancel()
+                    pump_error = await _safe_cancel(pump_task)
+            overflowed = overflow_event.is_set()
+
+            # 终态优先级：未清空 > 日志超限 > 超时 > 取消 > 遗留子进程 > 退出码
             if not cleared:
                 status, final_detail = (
                     "failed",
                     f"{detail or ''}; 进程组在硬等上限内未清空".strip("; "),
+                )
+            elif overflowed:
+                status = "failed"
+                final_detail = (
+                    f"{OVERFLOW_REASON}（上限 {config.LOG_MAX_BYTES} 字节）"
                 )
             elif outcome == "timeout":
                 status, final_detail = "failed", detail
@@ -337,6 +396,9 @@ class Scheduler:
                     f"主命令已退出(exit={exit_code})，但检测到遗留子进程，"
                     "进程组清理后按失败处理"
                 )
+            elif pump_error is not None:
+                status = "failed"
+                final_detail = f"日志读取异常: {pump_error!r}"
             elif exit_code == 0:
                 status, final_detail = "succeeded", None
             else:
@@ -348,50 +410,62 @@ class Scheduler:
                 _now(),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
                 detail=final_detail,
+                log_overflow=overflowed,
             )
-            self._append_log(
-                log_path,
-                [
-                    f"[runner] 步骤终态={status} exit={exit_code} "
-                    f"遗留子进程={had_leftovers} detail={final_detail or '-'}"
-                ],
+            writer.append_line(
+                f"[runner] 步骤终态={status} exit={exit_code} "
+                f"遗留子进程={had_leftovers} 日志超限={overflowed} "
+                f"detail={final_detail or '-'}"
             )
             return status
         finally:
-            log_f.close()
+            writer.close()
 
     async def _watch(
-        self, process: Any, timeout: float, cancel_event: asyncio.Event
+        self,
+        process: Any,
+        timeout: float,
+        cancel_event: asyncio.Event,
+        overflow_event: asyncio.Event,
     ) -> tuple[str, Optional[str]]:
-        """三者竞速：进程退出 / 取消 / 超时。取消与超时只负责发信号，
-        实际的进程组终止统一由调用方在清理阶段完成。"""
+        """四者竞速：进程退出 / 日志超限 / 取消 / 超时。
+
+        超限、取消与超时都只负责发信号，实际的进程组终止统一由调用方在
+        清理阶段完成；进程退出不代表成功，调用方仍要等待输出泵抽干并复核
+        日志是否超限。
+        """
         wait_task = asyncio.create_task(process.wait())
         cancel_task = asyncio.create_task(cancel_event.wait())
         timeout_task = asyncio.create_task(asyncio.sleep(timeout))
+        overflow_task = asyncio.create_task(overflow_event.wait())
         try:
             await asyncio.wait(
-                {wait_task, cancel_task, timeout_task},
+                {wait_task, overflow_task, cancel_task, timeout_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if overflow_task.done():
+                return (
+                    "log_overflow",
+                    f"日志达到落盘上限 {config.LOG_MAX_BYTES} 字节，终止整个进程组",
+                )
             if wait_task.done():
                 return "exited", None
             if cancel_task.done():
                 return "cancelled", "构建已取消，终止整个进程组"
             return "timeout", f"步骤超过 {timeout}s 超时，终止整个进程组"
         finally:
-            for task in (cancel_task, timeout_task):
+            for task in (cancel_task, timeout_task, overflow_task):
                 task.cancel()
-            await asyncio.gather(cancel_task, timeout_task, return_exceptions=True)
+            await asyncio.gather(
+                cancel_task, timeout_task, overflow_task, return_exceptions=True
+            )
 
     # ------------------------------------------------------------- 工具方法
 
     @staticmethod
     def _append_log(log_path: str, lines: list[str]) -> None:
-        try:
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write("\n".join(lines) + "\n")
-        except OSError:
-            pass
+        # 所有日志追加都必须经过上限管控，杜绝任何路径把文件写到上限之上
+        bounded_append_log(log_path, lines)
 
     @staticmethod
     def _log_task_exception(task: asyncio.Task[Any]) -> None:
@@ -403,6 +477,17 @@ class Scheduler:
         logging.getLogger("pipeline").exception(
             "构建任务异常: %s", task.exception()
         )
+
+
+async def _safe_cancel(task: asyncio.Task[Any]) -> Optional[BaseException]:
+    """收尾输出泵任务：取消并吞掉 CancelledError，返回真实异常（若有）。"""
+    try:
+        await task
+    except asyncio.CancelledError:
+        return None
+    except BaseException as exc:  # 输出泵自身异常，交由调用方判失败
+        return exc
+    return None
 
 
 def _safe_getpgid(pid: int) -> Optional[int]:
